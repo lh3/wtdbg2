@@ -417,6 +417,18 @@ static inline KBM* clone_seqs_kbm(KBM *src, KBMPar *par){
 	return dst;
 }
 
+static inline uint64_t mm_hash64(uint64_t key, uint64_t mask)
+{
+	key = (~key + (key << 21)) & mask; // key = (key << 21) - key - 1;
+	key = key ^ key >> 24;
+	key = ((key + (key << 3)) + (key << 8)) & mask; // key * 265
+	key = key ^ key >> 14;
+	key = ((key + (key << 2)) + (key << 4)) & mask; // key * 21
+	key = key ^ key >> 28;
+	key = (key + (key << 31)) & mask;
+	return key;
+}
+
 // rs[0]->n_head MUST >= 1
 static inline void split_FIXP_kmers_kbm(BaseBank *rdseqs, u8i offset, u4i length, u1i ksize, u1i psize, u4i kmod, kmeroffv *rs[2]){
 	kmer_off_t *kp;
@@ -521,13 +533,51 @@ static inline void split_FIXP_kmers_kbm(BaseBank *rdseqs, u8i offset, u4i length
 			}
 		}
 	}
-	for(b=0;b<2;b++){
-		for(i=0;(u4i)i<rs[b]->size;i++){
-			if(rs[b]->buffer[i].closed) continue;
-			hv = kbm_kmer_smear(rs[b]->buffer[i].kmer);
-			ki = hv % kmod;
-			if(ki >= KBM_N_HASH) rs[b]->buffer[i].closed = 1;
-			rs[b]->buffer[i].kidx = ki;
+	if (0) {
+		for(b=0;b<2;b++){
+			for(i=0;(u4i)i<rs[b]->size;i++){
+				if(rs[b]->buffer[i].closed) continue;
+				hv = kbm_kmer_smear(rs[b]->buffer[i].kmer);
+				ki = hv % kmod;
+				if(ki >= KBM_N_HASH) rs[b]->buffer[i].closed = 1;
+				rs[b]->buffer[i].kidx = ki;
+			}
+		}
+	} else { // minimizer. Adapted from sketch.c from minimap2. NB: assuming no ambiguous bases
+		assert(ksize == 0 || psize == 0); // TODO: not sure how kmer is constructed otherwise
+		for (b = 0; b < 2; ++b) {
+			kmer_off_t *klist = rs[b]->buffer;
+			int i, j, buf_pos, min_pos, w = kmod / KBM_N_HASH;
+			uint64_t mask = (1ULL<<2*(ksize+psize)) - 1;
+			struct { uint64_t x, y; } buf[256], info, min = { UINT64_MAX, UINT64_MAX };
+			memset(buf, 0xff, w * 16); // this is a ring buffer of fixed size w
+			for (i = 0; (u4i)i < rs[b]->size; ++i) // all kmers are initially closed
+				klist[i].closed = 1;
+			for (i = buf_pos = min_pos = 0; (u4i)i < rs[b]->size; ++i) {
+				info.x = mm_hash64(klist[i].kmer, mask), info.y = i;
+				klist[i].kidx = info.x % KBM_N_HASH;
+				buf[buf_pos] = info; // need to do this here as appropriate buf_pos and buf[buf_pos] are needed below
+				if (i == w - 1 && min.x != UINT64_MAX) // special case for the first window - because identical k-mers are not stored yet
+					for (j = 0; j < w; ++j)
+						if (j != buf_pos) // NB: forget why this is necessary
+							if (min.x == buf[j].x) klist[buf[j].y].closed = 0;
+				if (info.x <= min.x) { // a new minimum; then write the old min
+					if (i >= w && min.x != UINT64_MAX) klist[min.y].closed = 0;
+					min = info, min_pos = buf_pos;
+				} else if (buf_pos == min_pos) { // old min has moved outside the window
+					if (i >= w - 1 && min.x != UINT64_MAX) klist[min.y].closed = 0;
+					for (j = buf_pos + 1, min.x = UINT64_MAX; j < w; ++j) // the two loops are necessary when there are identical k-mers
+						if (min.x >= buf[j].x) min = buf[j], min_pos = j;
+					for (j = 0; j <= buf_pos; ++j)
+						if (min.x >= buf[j].x) min = buf[j], min_pos = j;
+					if (i >= w - 1 && min.x != UINT64_MAX)
+						for (j = 0; j < w; ++j)
+							if (min.x == buf[j].x) klist[buf[j].y].closed = 0;
+				}
+				if (++buf_pos == w) buf_pos = 0;
+			}
+			if (min.x != UINT64_MAX)
+				klist[min.y].closed = 0;
 		}
 	}
 }
